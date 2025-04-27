@@ -1,0 +1,130 @@
+import xarray as xr
+import numpy as np
+import pandas as pd
+import geopandas as gpd
+from mgwr.gwr import GWR
+from mgwr.sel_bw import Sel_BW
+from sklearn.metrics import r2_score
+
+#获取GRACE数据
+def ReGRACE(grace_data):
+    # 提取特定时间数据
+    specific_time = '129.5'
+    data_at_specific_time = grace_data.sel(time=specific_time).sel(lat=slice(32, 41), lon=slice(95, 119))
+    grace_var = data_at_specific_time['lwe_thickness'].values
+    grace_lon = data_at_specific_time['lon'].values
+    grace_lat = data_at_specific_time['lat'].values
+    return grace_var,grace_lon,grace_lat
+
+#获取GLDAS数据
+def ReGLADS(gldas_data):
+    gldas_lon = gldas_data['lon'].values
+    gldas_lat = gldas_data['lat'].values
+    avg_surf_t = gldas_data['AvgSurfT_inst'].values  # 地表温度
+    qsb_acc = gldas_data['Qsb_acc'].values  # 积雪融化量
+    rainf_f_tavg = gldas_data['Rainf_f_tavg'].values  # 降雨量
+    soil_moi = gldas_data['SoilMoi100_200cm_inst'].values  # 土壤湿度
+    tair_f_inst = gldas_data['Tair_f_inst'].values  # 近地表气温
+    return gldas_lon,gldas_lat,avg_surf_t,qsb_acc,rainf_f_tavg,soil_moi,tair_f_inst
+
+#重采样
+def Resample(mdata,lat,lon):
+    ds_resampled = mdata.interp(lat=lat, lon=lon, method='linear')
+    return ds_resampled
+
+#构建DataFrame
+def GeoDataFrame(lon,lat,var_1,var_2,var_3):
+    LON, LAT = np.meshgrid(lon, lat)
+    zhankai = pd.DataFrame({
+        'longitude': LON.flatten(),
+        'latitude': LAT.flatten(),
+        #'AvgSurfT_inst': avg_surf_t.flatten(),
+        'Qsb_acc': var_1.flatten(),
+        'Rainf_f_tavg': var_2.flatten(),
+        #'SoilMoi100_200cm_inst': soil_moi.flatten(),
+        #'Tair_f_inst': tair_f_inst.flatten(),
+        'GRACE_var': var_3.flatten()
+    })
+    #去除空值
+    zhankai = zhankai.dropna()
+    #转换为GeoDataFrame
+    gdf = gpd.GeoDataFrame(zhankai, geometry=gpd.points_from_xy(zhankai.longitude, zhankai.latitude))
+    return gdf
+
+#地理加权回归模型
+def jiang(coords,y,x,coords_1,x_1):
+    # 选择带宽 
+    selector = Sel_BW(coords, y, x)
+    b = selector.search(bw_min=2)
+    #运行GWR
+    model = GWR(coords, y, x, bw=b)
+    # results = model.fit()
+    # print(results.summary())
+    #预测
+    p = model.predict(coords_1, x_1)
+    return p.predy
+#保存为nc文件
+def Save_to_nc(lat1,lon1,arr):
+    lon2 = np.unique(lon1)
+    lat2 = np.unique(lat1)
+    new_var = np.full((len(lat2), len(lon2)), np.nan)
+    for i in range(len(lat2)):
+        for j in range(len(lon2)):
+            if (lat2[i], lon2[j]) in zip(lat1, lon1):
+                index = np.where((lat1 == lat2[i]) & (lon1 == lon2[j]))[0][0]
+                new_var[i, j] = arr[index]
+
+
+    ds = xr.Dataset(
+        {'var': (['lat', 'lon'], new_var)},
+        coords={
+            'lon': lon2,
+            'lat': lat2
+        }
+    )
+    ds.to_netcdf(r'D:\adad\shuchu\output.nc')
+    print(f'NetCDF 文件已创建。')
+
+if __name__ == "__main__":
+    #打开文件
+    grace_data=xr.open_dataset(r'D:\adad\Mascons\CSR_GRACE_GRACE-FO_RL0603_Mascons_all-corrections(1).nc')
+    gldas_data=xr.open_dataset(r'D:\adad\GLDAS\123.nc4').sel(lat=slice(32, 41), lon=slice(95, 119))
+    #获取数据
+    grace_var,grace_lon,grace_lat=ReGRACE(grace_data)
+    glads_lon,glads_lat,avg_surf_t,qsb_acc,rainf_f_tavg,soil_moi,tair_f_inst=ReGLADS(gldas_data)
+    #重采样
+    gldas_reda=Resample(gldas_data,grace_lat,grace_lon)
+    #获取数据
+    _,_,_,qsb_acc_re,rainf_f_tavg_re,_,_=ReGLADS(gldas_reda)
+    #构建DataFrame,GRACE与原始GLDAS
+    gdf_yuan=GeoDataFrame(glads_lon,glads_lat,qsb_acc,rainf_f_tavg,grace_var)
+    #构建DataFrame,GRACE与重采样后的GLDAS
+    gdf_re=GeoDataFrame(glads_lon,glads_lat,qsb_acc_re,rainf_f_tavg_re,grace_var)
+    #地理加权回归模型数据准备
+    coords = gdf_re[['longitude','latitude']].values
+    y = gdf_re['GRACE_var'].values.reshape(-1, 1)
+    x= gdf_re[['Qsb_acc','Rainf_f_tavg']].values
+    coords = np.array(coords, dtype=np.float64)
+    x = np.array(x, dtype=np.float64)
+    #误差
+    n1=jiang(coords,y,x,coords,x)
+    mse = np.mean((y -n1) ** 2)
+    print("均方根误差:", mse)
+    r2 = r2_score(y, n1)
+    print("决定系数 (R^2):", r2)
+    #地理加权回归模型并预测
+    coords_gldas=gdf_yuan[['longitude','latitude']].values
+    x_gldas=gdf_yuan[['Qsb_acc','Rainf_f_tavg']].values
+    if coords_gldas.shape[0]%2==0:
+        num_g=int(coords_gldas.shape[0]/2)
+    else:
+        num_g=int((coords_gldas.shape[0]+1)/2)
+    print(num_g)
+    arr1=jiang(coords,y,x,coords_gldas[:num_g],x_gldas[:num_g])
+    arr2=jiang(coords,y,x,coords_gldas[num_g:],x_gldas[num_g:])
+    arr=np.concatenate((arr1,arr2),axis=0)
+    print(arr)
+    #保存为nc文件用到的数据
+    lon_sa=gdf_yuan['longitude'].values
+    lat_sa=gdf_yuan['latitude'].values
+    Save_to_nc(lat_sa,lon_sa,arr)
